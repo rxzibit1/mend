@@ -4,7 +4,7 @@
 // In a trial the grader runs `node /bot/main.ts` with MAKEFUN_ENV_URL set, and then this file hands over to runner.ts
 // (the last lines below): keep that hand-over and runner.ts as they are, and write the CLI.
 
-import { mkdirSync, readdirSync, readFileSync, rmSync, rmdirSync, statSync, writeFileSync, writeSync } from 'node:fs';
+import { mkdirSync, readdirSync, readFileSync, readSync, rmSync, rmdirSync, statSync, writeFileSync, writeSync } from 'node:fs';
 import { dirname } from 'node:path';
 
 const FORMATS = ['auto', 'unified', 'search-replace', 'v4a', 'json'];
@@ -713,6 +713,26 @@ function detect(lines: string[]): string | null {
 
 const byteOrder = (a: string, b: string): number => Buffer.compare(Buffer.from(a), Buffer.from(b));
 
+const retryable = (e: unknown): boolean => ['EAGAIN', 'EINTR'].includes((e as { code?: string }).code ?? '');
+
+/** The whole of standard input; a closed or absent stdin reads as empty. A transient EAGAIN/EINTR is retried. */
+function readStdin(): string {
+  const parts: Buffer[] = [];
+  const buf = Buffer.alloc(1 << 16);
+  for (;;) {
+    let n: number;
+    try {
+      n = readSync(0, buf, 0, buf.length, null);
+    } catch (e) {
+      if (retryable(e)) continue;
+      break; // EOF, ENXIO, EBADF and the like: no more input
+    }
+    if (n === 0) break;
+    parts.push(Buffer.from(buf.subarray(0, n)));
+  }
+  return Buffer.concat(parts).toString('utf8');
+}
+
 function run(args: string[]): { code: number; out: string[] } {
   // §1 command line
   let format: string | null = null;
@@ -732,11 +752,13 @@ function run(args: string[]): { code: number; out: string[] } {
   if (pos.length > 1) return { code: 2, out: ['error: usage'] };
   const file = pos.length === 0 || pos[0] === '-' ? null : pos[0]!;
   let text = '';
-  try {
-    text = readFileSync(file ?? 0, 'utf8');
-  } catch {
-    if (file !== null) return { code: 2, out: ['error: no-patch'] };
-  }
+  if (file !== null) {
+    try {
+      text = readFileSync(file, 'utf8');
+    } catch {
+      return { code: 2, out: ['error: no-patch'] };
+    }
+  } else text = readStdin();
   const lines = patchLines(text);
   const kind = format === null || format === 'auto' ? detect(lines) : format;
   if (kind === null) return { code: 2, out: ['error: format'] };
@@ -818,6 +840,14 @@ if (trialEnv !== undefined && trialEnv !== '') {
   await runTrial(trialEnv);
 } else {
   const r = run(process.argv.slice(2));
-  writeSync(1, r.out.map((l) => `${l}\n`).join(''));
+  // a pipe may take fewer bytes than asked: write until all of the report is out
+  const report = Buffer.from(r.out.map((l) => `${l}\n`).join(''));
+  for (let off = 0; off < report.length; ) {
+    try {
+      off += writeSync(1, report, off);
+    } catch (e) {
+      if (!retryable(e)) throw e;
+    }
+  }
   process.exitCode = r.code;
 }
