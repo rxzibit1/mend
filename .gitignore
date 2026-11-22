@@ -1,0 +1,3 @@
+tests/*.json
+tests/diff-out/
+node_modules/
